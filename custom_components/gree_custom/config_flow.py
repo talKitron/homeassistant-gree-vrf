@@ -70,6 +70,7 @@ from .aiogree.errors import (
 from .aiogree.transport_mqtt import GreeMqttTransport
 from .aiogree.transport_udp import GreeUdpTransport
 from .const import (
+    REDACT_KEYS,
     ATTR_EXTERNAL_HUMIDITY_SENSOR,
     ATTR_EXTERNAL_TEMPERATURE_SENSOR,
     ATTR_FEATURES_TO_PROP_MAP,
