@@ -1155,14 +1155,16 @@ async def _gree_get_status_batch(
     props: list[str],
     cipher: CipherBase,
     transport: GreeBaseTransport,
+    _depth: int = 0,
 ) -> StatusResult:
-    """Query one batch of props, falling back to single prop queries.
+    """Query one batch of props, splitting it when the answer is unusable.
 
     Some units (e.g. Tadiran/Gree commercial units behind a cloud gateway)
-    answer a multi-prop request with fewer values than columns. The values
-    then cannot be assigned to props safely, so every prop of the batch is
-    queried on its own instead. Props that still have no value are reported
-    as missing, never guessed.
+    answer a multi-prop request with fewer values than columns, or with no
+    values at all. Such an answer cannot be assigned to props safely, so the
+    batch is split in halves and queried again, down to single props if
+    needed. Props that still have no value are reported as missing, never
+    guessed.
     """
     pack = _create_get_status_pack(mac_addr, props)
     json_payload = _create_payload(pack, "pack", 0, mac_addr, uid)
@@ -1171,52 +1173,69 @@ async def _gree_get_status_batch(
     )
 
     try:
-        return gree_process_status_pack(result, props)
+        res = gree_process_status_pack(result, props)
     except GreeMalformedResponseError as err:
         if len(props) <= 1:
             raise
+        reason = str(err)
+    else:
+        if res.prop_values or len(props) <= 1:
+            return res
+        reason = "no values returned"
 
-        _LOGGER.warning(
-            "[%s] Device '%s' via controller '%s' returned an ambiguous response "
-            "(%s) for %d props. Querying them one by one",
-            transport,
-            mac_addr,
-            mac_addr_controller,
-            err,
-            len(props),
-        )
+    # Only the first split is a warning, so a log without debug enabled still
+    # shows what the device answered. Responses carry no credentials.
+    log = _LOGGER.warning if _depth == 0 else _LOGGER.debug
+    log(
+        "[%s] Device '%s' via controller '%s' gave an unusable response (%s) "
+        "for %d props, splitting the request. Response: %s",
+        transport,
+        mac_addr,
+        mac_addr_controller,
+        reason,
+        len(props),
+        describe_status_pack(result, props),
+    )
 
     status: dict[str, str] = {}
     missing: list[str] = []
+    middle = len(props) // 2
 
-    for prop in props:
+    for part in (props[:middle], props[middle:]):
         try:
-            res = await _gree_get_status_batch(
-                mac_addr_controller, mac_addr, uid, [prop], cipher, transport
+            part_res = await _gree_get_status_batch(
+                mac_addr_controller,
+                mac_addr,
+                uid,
+                part,
+                cipher,
+                transport,
+                _depth + 1,
             )
         except GreeConnectionError:
             raise
         except GreeProtocolError:
             _LOGGER.debug(
-                "[%s] Device '%s' gave no usable value for prop '%s'",
+                "[%s] Device '%s' gave no usable value for props %s",
                 transport,
                 mac_addr,
-                prop,
+                part,
                 exc_info=True,
             )
-            missing.append(prop)
+            missing.extend(part)
             continue
 
-        status.update(res.prop_values)
-        missing.extend(res.missing_props)
+        status.update(part_res.prop_values)
+        missing.extend(part_res.missing_props)
 
-    _LOGGER.debug(
-        "[%s] Single prop queries for '%s': returned=%s missing=%s",
-        transport,
-        mac_addr,
-        list(status),
-        missing,
-    )
+    if _depth == 0:
+        _LOGGER.info(
+            "[%s] Split queries for '%s': returned=%s missing=%s",
+            transport,
+            mac_addr,
+            status,
+            missing,
+        )
     return StatusResult(prop_values=status, missing_props=missing)
 
 

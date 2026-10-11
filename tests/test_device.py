@@ -90,6 +90,25 @@ async def test_unanswered_device_info_does_not_block_setup(commercial_unit) -> N
     assert device.firmware_version is None
 
 
+async def test_commercial_unit_with_request_size_limit_binds(commercial_unit) -> None:
+    commercial_unit.max_cols = 8
+    device, _ = await _bind(commercial_unit)
+
+    assert device.power_mode is True
+    assert device.target_temperature == 24.0
+    assert device.indoors_temperature_c == 25
+
+
+async def test_numeric_strings_are_accepted() -> None:
+    values = {k: str(v) for k, v in COMMERCIAL_STATUS.items()}
+    values["SetTem"] = "24.0"
+    sim = CommercialUnitSimulator(values=values)
+    device, _ = await _bind(sim)
+
+    assert device.power_mode is True
+    assert device.target_temperature == 24.0
+
+
 async def test_no_status_at_all_fails_setup() -> None:
     sim = CommercialUnitSimulator(values={})
 

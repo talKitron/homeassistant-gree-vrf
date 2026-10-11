@@ -37,11 +37,14 @@ class CommercialUnitSimulator:
         valueless: set[str] | None = None,
         sub_in_response: bool = True,
         lag_reads: int = 0,
+        max_cols: int | None = None,
     ) -> None:
         self.values = dict(values)
         self.valueless = set(valueless or ())
         self.sub_in_response = sub_in_response
         self.lag_reads = lag_reads
+        # Larger requests get an empty answer (cols=[], dat=[])
+        self.max_cols = max_cols
         self._lagging_left = 0
         self._old_values: dict[str, Any] = {}
         self.status_requests: list[list[str]] = []
@@ -62,6 +65,9 @@ class CommercialUnitSimulator:
 
         requested = list(pack["cols"])
         self.status_requests.append(requested)
+
+        if self.max_cols is not None and len(requested) > self.max_cols:
+            return {"t": "dat", "r": 200, "mac": pack["mac"], "cols": [], "dat": []}
 
         values = self.values
         if self._lagging_left > 0:

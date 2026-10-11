@@ -31,6 +31,15 @@ MQTT_SERVERS = {
 }
 
 
+def _create_tls_context() -> ssl.SSLContext:
+    """Create the TLS context for the Gree broker."""
+    tls_context = ssl.create_default_context()
+    # Allow self-signed certificates (Gree broker uses custom cert)
+    tls_context.check_hostname = False
+    tls_context.verify_mode = ssl.CERT_NONE
+    return tls_context
+
+
 class GreeMqttTransport(GreeBaseTransport):
     """MQTT transport."""
 
@@ -80,11 +89,10 @@ class GreeMqttTransport(GreeBaseTransport):
         # A client left behind by a lost connection must be closed first
         await self._discard_client()
 
-        # Create TLS context for secure connection
-        tls_context = ssl.create_default_context()
-        # Allow self-signed certificates (Gree broker uses custom cert)
-        tls_context.check_hostname = False
-        tls_context.verify_mode = ssl.CERT_NONE
+        # Loading the CA store does disk I/O: keep it off the event loop
+        tls_context = await asyncio.get_running_loop().run_in_executor(
+            None, _create_tls_context
+        )
 
         self._client = aiomqtt.Client(
             hostname=MQTT_SERVERS[self._region],

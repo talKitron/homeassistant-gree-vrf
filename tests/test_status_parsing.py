@@ -124,15 +124,28 @@ async def test_status_falls_back_to_single_prop_queries(cipher) -> None:
 
     res = await gree_get_status(PARENT_MAC, CHILD_MAC, 0, INFO_PROPS, cipher, transport)
 
-    # First the batch, then one request per prop
+    # First the full batch, then smaller ones
     assert sim.status_requests[0] == INFO_PROPS
-    assert sim.status_requests[1:] == [[p] for p in INFO_PROPS]
+    assert len(sim.status_requests) > 1
 
     assert res.prop_values == COMMERCIAL_INFO
     assert sorted(res.missing_props) == sorted(
         ["bc", "ModelNew", "host", "wifiStatus", "wifiReset"]
     )
     assert "bc" not in res.prop_values
+
+
+async def test_empty_answer_to_large_request_is_split(cipher) -> None:
+    """A unit that answers nothing to big requests still gets read, not marked unsupported."""
+    values = {"Pow": 1, "Mod": 1, "SetTem": 24, "WdSpd": 3, "SwUpDn": 0, "TemUn": 0}
+    sim = CommercialUnitSimulator(values=values, max_cols=2)
+    transport = FakeTransport(sim)
+    props = [*values, "Tur", "Quiet"]
+
+    res = await gree_get_status(PARENT_MAC, CHILD_MAC, 0, props, cipher, transport)
+
+    assert res.prop_values == values
+    assert sorted(res.missing_props) == ["Quiet", "Tur"]
 
 
 async def test_status_without_mismatch_uses_one_request(cipher) -> None:

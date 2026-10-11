@@ -104,6 +104,9 @@ class GreeDevice:
             userid=user_id,
         )
 
+        # Last status read (values, missing props), kept for error reports
+        self._last_status: tuple[dict[str, str], list[str]] = ({}, [])
+
         # Props sent by the last command that the device did not report back
         self._unconfirmed: dict[GreeProp, int] = {}
 
@@ -274,10 +277,11 @@ class GreeDevice:
         )
 
         try:
-            status, _ = await self._client.query_props(
+            status, missing = await self._client.query_props(
                 [prop.value for prop in self._state.polled_properties],
                 len(self._state.polled_properties),
             )
+            self._last_status = (status, missing)
 
             _LOGGER.debug(
                 "[%s:%s] Got device status: %s", self.unique_id, self.transport, status
@@ -410,8 +414,10 @@ class GreeDevice:
         # An empty status is a failed request, not proof that nothing is supported.
         # Pruning on it would leave the device with no properties to poll for good.
         if self._state.polled_properties and not self._state.raw:
+            status, missing = self._last_status
             raise GreeProtocolError(
-                f"Device '{self._mac_addr}' returned no status values, cannot detect supported properties"
+                f"Device '{self._mac_addr}' returned no usable status values, cannot "
+                f"detect supported properties. Received: {status}, missing: {missing}"
             )
 
         # Remove all unsupported properties
