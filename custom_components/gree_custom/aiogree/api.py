@@ -1287,21 +1287,34 @@ async def gree_set_status(
     # Sometimes the response have them, sometimes don't or they actually miss set props
     # As such, don't error/raise if that is the case
     # the fields bellow are optional
-    options_set: list[str] = result.get("opt", [])
-    values_set_1 = list(map(int, result.get("p", [])))
-    values_set_2 = list(map(int, result.get("val", [])))  # If present, must match [p]
+    # The echo is informational only: callers read the state back to verify.
+    # Some units (e.g. commercial gateways) echo lists of different lengths or
+    # non-numeric values, which must not turn an applied command into an error.
+    options_set = result.get("opt") or []
+    values_set = result.get("p") or result.get("val") or []
 
     # In case the response has nothing, but didn't had a error code
     # Assume all was set and return all given props
-    if len(options_set) == 0:
+    if not options_set:
         return prop_values
 
-    if len(values_set_2) > 0 and len(values_set_1) != len(values_set_2):
-        raise GreeProtocolError(
-            f"Options and values set mismatch {options_set} {values_set_1}"
+    if len(options_set) != len(values_set):
+        _LOGGER.debug(
+            "[%s] Command echo does not match: opt=%s p=%s val=%s",
+            transport,
+            options_set,
+            result.get("p"),
+            result.get("val"),
         )
+        return prop_values
 
-    updated_props = dict(zip(options_set, values_set_1, strict=True))
+    updated_props: dict[str, int] = {}
+    for opt, value in zip(options_set, values_set, strict=True):
+        try:
+            updated_props[str(opt)] = int(value)
+        except (TypeError, ValueError):
+            _LOGGER.debug("[%s] Non-numeric echo for %s: %r", transport, opt, value)
+
     if updated_props != prop_values:
         _LOGGER.debug(
             "[%s] Expected updated props %s but got %s",

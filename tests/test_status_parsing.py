@@ -206,3 +206,22 @@ async def test_set_status_error_code_raises(cipher) -> None:
 
     with pytest.raises(GreeProtocolError):
         await gree_set_status(PARENT_MAC, CHILD_MAC, 0, {"Pow": 1}, cipher, transport)
+
+
+async def test_set_status_tolerates_mismatched_echo(cipher) -> None:
+    """An applied command must not fail because the echo lists do not line up."""
+    sim = CommercialUnitSimulator(values={"Pow": 0, "Mod": 1})
+    sim._cmd = lambda pack: {"t": "res", "r": 200, "opt": ["Pow", "Mod"], "p": [1]}
+    transport = FakeTransport(sim)
+
+    result = await gree_set_status(PARENT_MAC, CHILD_MAC, 0, {"Pow": 1, "Mod": 1}, cipher, transport)
+
+    assert result == {"Pow": 1, "Mod": 1}
+
+
+async def test_set_status_tolerates_non_numeric_echo(cipher) -> None:
+    sim = CommercialUnitSimulator(values={"Pow": 0})
+    sim._cmd = lambda pack: {"t": "res", "r": 200, "opt": ["Pow"], "p": [""]}
+    transport = FakeTransport(sim)
+
+    await gree_set_status(PARENT_MAC, CHILD_MAC, 0, {"Pow": 1}, cipher, transport)
