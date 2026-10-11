@@ -66,6 +66,9 @@ class GreeBaseTransport(ABC):
         """Init transport."""
         self._listeners: dict[str, set[Callable[[str, dict], None]]] = defaultdict(set)
         self.connected_devices: Counter[str] = Counter()
+        # Most props per status request each controller answered, learned when
+        # a larger request went unanswered
+        self.status_batch_limits: dict[str, int] = {}
 
     @abstractmethod
     async def connect(self) -> None:

@@ -985,11 +985,14 @@ async def gree_get_status(
     batches: list[list[str]] = []
     current: list[str] = []
     current_size = EMPTY_PACK_OVERHEAD
+    max_props = transport.status_batch_limits.get(mac_addr_controller)
 
     for prop in prop_names:
         prop_size = len(json.dumps([prop]).encode())
 
-        if current_size + prop_size < MAX_PACK_SIZE:
+        if current_size + prop_size < MAX_PACK_SIZE and (
+            max_props is None or len(current) < max_props
+        ):
             current.append(prop)
             current_size += prop_size
         else:
@@ -1168,20 +1171,31 @@ async def _gree_get_status_batch(
     """
     pack = _create_get_status_pack(mac_addr, props)
     json_payload = _create_payload(pack, "pack", 0, mac_addr, uid)
-    result = await gree_get_response_pack(
-        mac_addr_controller, json_payload, cipher, transport
-    )
+    unanswered = False
 
     try:
-        res = gree_process_status_pack(result, props)
-    except GreeMalformedResponseError as err:
-        if len(props) <= 1:
+        result = await gree_get_response_pack(
+            mac_addr_controller, json_payload, cipher, transport
+        )
+    except GreeConnectionError as err:
+        # Some gateways silently drop requests for too many props. Only split
+        # while the connection itself is up, so an outage still fails fast.
+        if len(props) <= 1 or getattr(transport, "connected", None) is not True:
             raise
+        result = {}
+        unanswered = True
         reason = str(err)
     else:
-        if res.prop_values or len(props) <= 1:
-            return res
-        reason = "no values returned"
+        try:
+            res = gree_process_status_pack(result, props)
+        except GreeMalformedResponseError as err:
+            if len(props) <= 1:
+                raise
+            reason = str(err)
+        else:
+            if res.prop_values or len(props) <= 1:
+                return res
+            reason = "no values returned"
 
     # Only the first split is a warning, so a log without debug enabled still
     # shows what the device answered. Responses carry no credentials.
@@ -1200,6 +1214,8 @@ async def _gree_get_status_batch(
     status: dict[str, str] = {}
     missing: list[str] = []
     middle = len(props) // 2
+    connection_error: GreeConnectionError | None = None
+    answered = 0
 
     for part in (props[:middle], props[middle:]):
         try:
@@ -1212,8 +1228,13 @@ async def _gree_get_status_batch(
                 transport,
                 _depth + 1,
             )
-        except GreeConnectionError:
-            raise
+        except GreeConnectionError as err:
+            if getattr(transport, "connected", None) is not True:
+                raise
+            # A single prop the gateway never answers is treated as missing
+            connection_error = err
+            missing.extend(part)
+            continue
         except GreeProtocolError:
             _LOGGER.debug(
                 "[%s] Device '%s' gave no usable value for props %s",
@@ -1227,6 +1248,25 @@ async def _gree_get_status_batch(
 
         status.update(part_res.prop_values)
         missing.extend(part_res.missing_props)
+        answered += 1
+
+    if answered == 0 and connection_error is not None:
+        raise connection_error
+
+    if unanswered:
+        # Remember the size that worked, so polls do not wait on a timeout again
+        limit = max(1, middle)
+        previous = transport.status_batch_limits.get(mac_addr_controller)
+        if previous is None or limit < previous:
+            transport.status_batch_limits[mac_addr_controller] = limit
+            _LOGGER.info(
+                "[%s] Controller '%s' does not answer requests for %d props, "
+                "using at most %d per request",
+                transport,
+                mac_addr_controller,
+                len(props),
+                limit,
+            )
 
     if _depth == 0:
         _LOGGER.info(

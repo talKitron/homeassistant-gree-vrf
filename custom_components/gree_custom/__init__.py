@@ -119,6 +119,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: GreeConfigEntry) -> bool
     cloud_conf = conf.get(CONF_CLOUD) or {}
     device_configs: dict[str, Any] = conf[CONF_DEVICES]
     coordinators: dict[str, GreeCoordinator] = {}
+    unreachable: list[str] = []
     mqtt_transport: GreeMqttTransport | None = None
     local_transports: dict[str, GreeUdpTransport] = {}
 
@@ -211,6 +212,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: GreeConfigEntry) -> bool
             if not await try_find_new_ip(hass, device, entry):
                 _LOGGER.exception("Error setting up device %s", mac)
                 create_device_connection_issue(hass, entry.entry_id, mac, name)
+                unreachable.append(mac)
         except Exception as err:
             _LOGGER.exception("Error setting up device %s", mac)
             create_device_connection_issue(hass, entry.entry_id, mac, name)
@@ -230,6 +232,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: GreeConfigEntry) -> bool
             await coordinators[device.mac_address].async_config_entry_first_refresh()
 
             _LOGGER.debug("Setup entry '%s': Bound to device %s", entry.entry_id, mac)
+
+    # Nothing could be set up: let Home Assistant retry later, so a device that
+    # was briefly unreachable (cloud, MQTT) comes back without a manual reload
+    if unreachable and not coordinators:
+        if mqtt_transport:
+            await mqtt_transport.disconnect()
+        raise ConfigEntryNotReady(f"Devices not reachable: {', '.join(unreachable)}")
 
     # Clear MQTT Transport if not used
     if mqtt_transport and not any(

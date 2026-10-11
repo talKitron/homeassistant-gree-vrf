@@ -38,6 +38,7 @@ class CommercialUnitSimulator:
         sub_in_response: bool = True,
         lag_reads: int = 0,
         max_cols: int | None = None,
+        silent_above: int | None = None,
     ) -> None:
         self.values = dict(values)
         self.valueless = set(valueless or ())
@@ -45,6 +46,8 @@ class CommercialUnitSimulator:
         self.lag_reads = lag_reads
         # Larger requests get an empty answer (cols=[], dat=[])
         self.max_cols = max_cols
+        # Larger requests get no answer at all (timeout)
+        self.silent_above = silent_above
         self._lagging_left = 0
         self._old_values: dict[str, Any] = {}
         self.status_requests: list[list[str]] = []
@@ -65,6 +68,9 @@ class CommercialUnitSimulator:
 
         requested = list(pack["cols"])
         self.status_requests.append(requested)
+
+        if self.silent_above is not None and len(requested) > self.silent_above:
+            raise GreeConnectionError("No MQTT response within 10.0s")
 
         if self.max_cols is not None and len(requested) > self.max_cols:
             return {"t": "dat", "r": 200, "mac": pack["mac"], "cols": [], "dat": []}
@@ -106,9 +112,14 @@ class FakeTransport(GreeBaseTransport):
         self.simulator = simulator
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.offline = False
+        self._connected = True
 
     def __str__(self) -> str:
         return "FakeTransport"
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
 
     async def connect(self) -> None:
         return None
@@ -127,7 +138,9 @@ class FakeTransport(GreeBaseTransport):
 
     async def request_json(self, mac_controller, payload, cipher):  # noqa: D102
         if self.offline:
+            self._connected = False
             raise GreeConnectionError("offline")
+        self._connected = True
         self.requests.append((mac_controller, copy.deepcopy(payload)))
         return {"pack": self.simulator.handle(payload["pack"])}
 

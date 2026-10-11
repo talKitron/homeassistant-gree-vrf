@@ -181,6 +181,7 @@ async def test_connection_error_during_fallback_propagates(cipher) -> None:
         nonlocal calls
         calls += 1
         if calls == 3:
+            transport._connected = False  # what a lost MQTT connection reports
             raise GreeConnectionError("lost")
         return original(pack)
 

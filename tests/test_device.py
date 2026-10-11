@@ -99,6 +99,34 @@ async def test_commercial_unit_with_request_size_limit_binds(commercial_unit) ->
     assert device.indoors_temperature_c == 25
 
 
+async def test_unit_ignoring_large_requests_binds_and_remembers_limit(commercial_unit) -> None:
+    """The gateway does not answer requests for many props: split, then keep the size."""
+    commercial_unit.silent_above = 12
+    device, transport = await _bind(commercial_unit)
+
+    assert device.power_mode is True
+    assert device.target_temperature == 24.0
+    limit = transport.status_batch_limits[PARENT_MAC]
+    assert limit <= 12
+
+    commercial_unit.status_requests.clear()
+    commercial_unit.values["Pow"] = 0
+    await device.fetch_device_status()
+
+    assert device.power_mode is False
+    assert all(len(r) <= limit for r in commercial_unit.status_requests)
+
+
+async def test_outage_is_not_mistaken_for_large_request(commercial_unit) -> None:
+    device, transport = await _bind(commercial_unit)
+    transport.offline = True
+
+    with pytest.raises(GreeConnectionError):
+        await device.fetch_device_status()
+
+    assert not transport.status_batch_limits
+
+
 async def test_numeric_strings_are_accepted() -> None:
     values = {k: str(v) for k, v in COMMERCIAL_STATUS.items()}
     values["SetTem"] = "24.0"
