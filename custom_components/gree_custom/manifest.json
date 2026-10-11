@@ -31,14 +31,14 @@
             "macaddress": "C03937*"
         }
     ],
-    "documentation": "https://github.com/Black01986/homeassistant-gree-vrf",
+    "documentation": "https://github.com/talKitron/homeassistant-gree-vrf",
     "integration_type": "hub",
     "iot_class": "local_polling",
-    "issue_tracker": "https://github.com/Black01986/homeassistant-gree-vrf/issues",
+    "issue_tracker": "https://github.com/talKitron/homeassistant-gree-vrf/issues",
     "requirements": [
         "asyncio_dgram",
         "aiomqtt",
         "pydantic"
     ],
-    "version": "0.1.8"
+    "version": "0.1.9"
 }

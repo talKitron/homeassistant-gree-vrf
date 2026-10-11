@@ -13,7 +13,13 @@ from pydantic import BaseModel, ConfigDict
 from .cipher import CipherBase, EncryptionVersion, get_cipher
 from .cloud_api import GreeCloudApi
 from .const import DEFAULT_DEVICE_PORT, DEFAULT_DEVICE_USERID, MAX_PACK_SIZE
-from .errors import GreeBindingError, GreeConnectionError, GreeError, GreeProtocolError
+from .errors import (
+    GreeBindingError,
+    GreeConnectionError,
+    GreeError,
+    GreeMalformedResponseError,
+    GreeProtocolError,
+)
 from .helpers import gree_extract_macs, redact_str
 from .transport import GreeBaseTransport
 from .transport_udp import GreeUdpTransport, async_udp_broadcast_request
@@ -1008,12 +1014,14 @@ async def gree_get_status(
 
     try:
         for batched_props in batches:
-            pack = _create_get_status_pack(mac_addr, batched_props)
-            json_payload = _create_payload(pack, "pack", 0, mac_addr, uid)
-            result = await gree_get_response_pack(
-                mac_addr_controller, json_payload, cipher, transport
+            res = await _gree_get_status_batch(
+                mac_addr_controller,
+                mac_addr,
+                uid,
+                batched_props,
+                cipher,
+                transport,
             )
-            res = gree_process_status_pack(result, batched_props)
             status.update(res.prop_values)
             missing.extend(res.missing_props)
 
@@ -1039,6 +1047,10 @@ def gree_process_status_pack(pack: dict, props: list[str] | None) -> StatusResul
         Mapping of property names to values, along with a list of
         properties that were not returned by the device.
 
+    Raises:
+        GreeMalformedResponseError: When the values cannot be mapped
+            unambiguously to the property names.
+
     """
     # Gree protocol provides best-effort responses
     # Meaning:
@@ -1056,9 +1068,27 @@ def gree_process_status_pack(pack: dict, props: list[str] | None) -> StatusResul
         if len(cols) == 1:
             # if there is a single prop without value, add to missing
             _LOGGER.warning("Device queried for invalid prop: %s", cols)
-            return StatusResult(prop_values={}, missing_props=cols)
+            return StatusResult(prop_values={}, missing_props=list(cols))
 
-        raise GreeProtocolError(f"Malformed response: cols={len(cols)} dat={len(dat)}")
+        # With more than one column there is no way to know which value is
+        # missing. Never zip them: that would assign values to the wrong props.
+        _LOGGER.debug(
+            "Malformed status response: %s", describe_status_pack(pack, props)
+        )
+        raise GreeMalformedResponseError(
+            f"Malformed response: cols={len(cols)} dat={len(dat)}"
+        )
+
+    if props and cols and not set(cols) & set(props):
+        # A response for another request (e.g. a late answer to a request that
+        # timed out) must not be mistaken for this one.
+        _LOGGER.debug(
+            "Status response does not match the request: %s",
+            describe_status_pack(pack, props),
+        )
+        raise GreeMalformedResponseError(
+            "Status response does not contain any of the requested props"
+        )
 
     status_values: dict[str, str] = {}
     returned_props: set[str] = set()
@@ -1074,7 +1104,12 @@ def gree_process_status_pack(pack: dict, props: list[str] | None) -> StatusResul
             if intem is not None:
                 status_values["TemSen"] = intem
                 returned_props.add("TemSen")
-        if "TemRec" not in status_values:
+        # Only derive TemRec from data in this pack, or when it was asked
+        # for, so a partial (pushed) pack does not overwrite the half degree
+        if "TemRec" not in status_values and (
+            "Add0.5" in status_values
+            or (props and "TemRec" in props and "SetTem" in status_values)
+        ):
             status_values["TemRec"] = int(status_values.get("Add0.5", 0) or 0)
             returned_props.add("TemRec")
 
@@ -1086,6 +1121,103 @@ def gree_process_status_pack(pack: dict, props: list[str] | None) -> StatusResul
 
     _LOGGER.debug("Got status for device: %s", status_values)
     return StatusResult(prop_values=status_values, missing_props=invalid_props)
+
+
+def describe_status_pack(pack: dict, props: list[str] | None) -> dict[str, Any]:
+    """Summarize a decrypted status pack for diagnostics.
+
+    Status packs carry no credentials, but only whitelisted metadata is
+    included so that a future protocol change cannot leak anything sensitive.
+    """
+    cols = list(pack.get("cols") or [])
+    dat = list(pack.get("dat") or [])
+    requested = list(props or [])
+
+    return {
+        "t": pack.get("t"),
+        "r": pack.get("r"),
+        "mac": pack.get("mac"),
+        "sub": pack.get("sub"),
+        "requested": requested,
+        "cols": cols,
+        "dat": dat,
+        "len_cols": len(cols),
+        "len_dat": len(dat),
+        "requested_not_returned": [p for p in requested if p not in cols],
+        "returned_not_requested": [c for c in cols if requested and c not in requested],
+    }
+
+
+async def _gree_get_status_batch(
+    mac_addr_controller: str,
+    mac_addr: str,
+    uid: int,
+    props: list[str],
+    cipher: CipherBase,
+    transport: GreeBaseTransport,
+) -> StatusResult:
+    """Query one batch of props, falling back to single prop queries.
+
+    Some units (e.g. Tadiran/Gree commercial units behind a cloud gateway)
+    answer a multi-prop request with fewer values than columns. The values
+    then cannot be assigned to props safely, so every prop of the batch is
+    queried on its own instead. Props that still have no value are reported
+    as missing, never guessed.
+    """
+    pack = _create_get_status_pack(mac_addr, props)
+    json_payload = _create_payload(pack, "pack", 0, mac_addr, uid)
+    result = await gree_get_response_pack(
+        mac_addr_controller, json_payload, cipher, transport
+    )
+
+    try:
+        return gree_process_status_pack(result, props)
+    except GreeMalformedResponseError as err:
+        if len(props) <= 1:
+            raise
+
+        _LOGGER.warning(
+            "[%s] Device '%s' via controller '%s' returned an ambiguous response "
+            "(%s) for %d props. Querying them one by one",
+            transport,
+            mac_addr,
+            mac_addr_controller,
+            err,
+            len(props),
+        )
+
+    status: dict[str, str] = {}
+    missing: list[str] = []
+
+    for prop in props:
+        try:
+            res = await _gree_get_status_batch(
+                mac_addr_controller, mac_addr, uid, [prop], cipher, transport
+            )
+        except GreeConnectionError:
+            raise
+        except GreeProtocolError:
+            _LOGGER.debug(
+                "[%s] Device '%s' gave no usable value for prop '%s'",
+                transport,
+                mac_addr,
+                prop,
+                exc_info=True,
+            )
+            missing.append(prop)
+            continue
+
+        status.update(res.prop_values)
+        missing.extend(res.missing_props)
+
+    _LOGGER.debug(
+        "[%s] Single prop queries for '%s': returned=%s missing=%s",
+        transport,
+        mac_addr,
+        list(status),
+        missing,
+    )
+    return StatusResult(prop_values=status, missing_props=missing)
 
 
 async def gree_set_status(
@@ -1413,7 +1545,7 @@ async def gree_discover_devices_cloud(
     responses = await cloud_api.get_all_devices()
 
     for dev in responses:
-        _LOGGER.warning("VRF DEBUG: mac=%s pmac=%s name=%s", dev.mac, dev.pmac, dev.name)
+        _LOGGER.debug("VRF DEBUG: mac=%s pmac=%s name=%s", dev.mac, dev.pmac, dev.name)
         mac, mac_controller = gree_extract_macs(dev.mac)
         if dev.pmac:
             mac_controller = dev.pmac.replace(":", "").replace("-", "").strip().lower()

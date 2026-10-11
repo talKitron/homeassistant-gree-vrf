@@ -976,7 +976,7 @@ class SetupConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         d = self._selected_devices[self._current_setup_device_index]
 
-        _LOGGER.warning(
+        _LOGGER.debug(
             "VRF FLOW: device=%s mqtt_controller=%s key_present=%s user_input=%s",
             d.mac,
             d.mac_controller_mqtt,
@@ -1315,7 +1315,7 @@ class SetupConfigFlow(ConfigFlow, domain=DOMAIN):
 
         _LOGGER.debug(
             "New entry with config: %s",
-            async_redact_data(data, ["encryption_key"]),
+            async_redact_data(data, REDACT_KEYS),
         )
         return self.async_create_entry(
             title=title,

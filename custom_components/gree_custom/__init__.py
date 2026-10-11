@@ -33,6 +33,7 @@ from .aiogree.transport_udp import GreeUdpTransport
 
 # Local imports
 from .const import (
+    REDACT_KEYS,
     CONF_CLOUD,
     CONF_DEVICE_CONNECTION,
     CONF_DEVICE_CONNECTION_CLOUD,
@@ -107,7 +108,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: GreeConfigEntry) -> bool
     _LOGGER.debug(
         "Setup entry '%s': data=%s",
         entry.entry_id,
-        json.dumps(async_redact_data(entry.data, ["encryption_key"])),
+        json.dumps(async_redact_data(entry.data, REDACT_KEYS)),
     )
 
     conf = entry.data

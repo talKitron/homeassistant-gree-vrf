@@ -11,7 +11,7 @@ from typing import override
 import aiomqtt
 
 from .cloud_api import GreeRegion
-from .errors import GreeRuntimeError
+from .errors import GreeConnectionError, GreeRuntimeError
 from .transport import GreeBaseTransport
 
 _LOGGER = logging.getLogger(__name__)
@@ -77,6 +77,9 @@ class GreeMqttTransport(GreeBaseTransport):
         if self._connected:
             return
 
+        # A client left behind by a lost connection must be closed first
+        await self._discard_client()
+
         # Create TLS context for secure connection
         tls_context = ssl.create_default_context()
         # Allow self-signed certificates (Gree broker uses custom cert)
@@ -106,26 +109,19 @@ class GreeMqttTransport(GreeBaseTransport):
 
     @override
     async def disconnect(self) -> None:
-        if not self._connected or not self._client:
-            return
-
-        # Close MQTT client
-        try:
-            await self._client.__aexit__(None, None, None)  # pylint: disable=unnecessary-dunder-call
-        except Exception:
-            _LOGGER.exception("Error closing MQTT client")
-        finally:
-            self._client = None
-
         # Clear receive task
         if self._receive_task:
+            self._receive_task.remove_done_callback(self._receive_task_done)
             self._receive_task.cancel()
 
-            with contextlib.suppress(asyncio.CancelledError):
+            # A task that already ended re-raises its own error here
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._receive_task
 
-            self._receive_task.remove_done_callback(self._receive_task_done)
             self._receive_task = None
+
+        # Close MQTT client
+        await self._discard_client()
 
         self._pending = None
 
@@ -134,42 +130,59 @@ class GreeMqttTransport(GreeBaseTransport):
 
     @override
     async def subscribe(self, mac_controller: str) -> None:
-        await self.connect()
+        await self._ensure_connected()
 
         if not self._connected or not self._client:
             raise GreeRuntimeError("MQTT transport not connected")
 
         if mac_controller not in self.connected_devices:
-            topics = [
-                f"response/{mac_controller}/#",
-                f"status/{mac_controller}/#",
-                f"connect/{mac_controller}",
-            ]
-
-            for topic in topics:
-                await self._client.subscribe(topic, qos=1)
-                _LOGGER.debug("Subscribed to topic: %s", topic)
+            await self._subscribe_topics(mac_controller)
 
         self.connected_devices[mac_controller] += 1
 
-    @override
-    async def unsubscribe(self, mac_controller: str) -> None:
-        if not self._connected or not self._client:
+    @staticmethod
+    def _topics(mac_controller: str) -> list[str]:
+        return [
+            f"response/{mac_controller}/#",
+            f"status/{mac_controller}/#",
+            f"connect/{mac_controller}",
+        ]
+
+    async def _subscribe_topics(self, mac_controller: str) -> None:
+        if not self._client:
             raise GreeRuntimeError("MQTT transport not connected")
 
+        for topic in self._topics(mac_controller):
+            await self._client.subscribe(topic, qos=1)
+            _LOGGER.debug("Subscribed to topic: %s", topic)
+
+    async def _ensure_connected(self) -> None:
+        """Connect, and after a lost connection restore the subscriptions."""
+        if self._connected:
+            return
+
+        reconnecting = bool(self.connected_devices)
+        if reconnecting:
+            _LOGGER.info("Reconnecting to MQTT broker %s", self._region.name)
+
+        await self.connect()
+
+        if reconnecting:
+            for mac_controller in list(self.connected_devices):
+                await self._subscribe_topics(mac_controller)
+
+    @override
+    async def unsubscribe(self, mac_controller: str) -> None:
         if self.connected_devices[mac_controller] > 1:
             self.connected_devices[mac_controller] -= 1
         else:
             self.connected_devices.pop(mac_controller, None)
-            topics = [
-                f"response/{mac_controller}/#",
-                f"status/{mac_controller}/#",
-                f"connect/{mac_controller}",
-            ]
 
-            for topic in topics:
-                await self._client.unsubscribe(topic)
-                _LOGGER.debug("Unsubscribed from topic: %s", topic)
+            # After a lost connection the broker already dropped the subscriptions
+            if self._connected and self._client:
+                for topic in self._topics(mac_controller):
+                    await self._client.unsubscribe(topic)
+                    _LOGGER.debug("Unsubscribed from topic: %s", topic)
 
         if len(self.connected_devices) == 0:
             return await self.disconnect()
@@ -180,8 +193,15 @@ class GreeMqttTransport(GreeBaseTransport):
     async def request(self, mac_controller: str, json_str: str) -> str:
         """Publish one MQTT request and wait for its response."""
 
+        try:
+            await self._ensure_connected()
+        except aiomqtt.MqttError as err:
+            raise GreeConnectionError(
+                f"Cannot connect to MQTT broker {self._region.name}"
+            ) from err
+
         if not self._connected or not self._client:
-            raise GreeRuntimeError("Transport not connected")
+            raise GreeConnectionError("MQTT transport not connected")
 
         async with self._request_lock:
             future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
@@ -200,6 +220,17 @@ class GreeMqttTransport(GreeBaseTransport):
                     timeout=self._timeout,
                 )
 
+            except TimeoutError as err:
+                raise GreeConnectionError(
+                    f"No MQTT response from {mac_controller} within {self._timeout}s"
+                ) from err
+
+            except aiomqtt.MqttError as err:
+                self._connected = False
+                raise GreeConnectionError(
+                    f"MQTT error while requesting {mac_controller}"
+                ) from err
+
             finally:
                 self._pending = None
 
@@ -211,12 +242,28 @@ class GreeMqttTransport(GreeBaseTransport):
 
         exception = task.exception()
         if exception:
-            _LOGGER.debug(
-                "MQTT receive loop stopped with exception",
-                exc_info=exception,
+            _LOGGER.warning(
+                "MQTT connection to %s lost (%s). It will reconnect on the next request",
+                self._region.name,
+                type(exception).__name__,
             )
+            _LOGGER.debug("MQTT receive loop exception", exc_info=exception)
         else:
             _LOGGER.debug("MQTT receive loop stopped normally")
+
+        # The receive loop only ends when the connection is gone
+        self._connected = False
+        if self._pending and not self._pending.done():
+            self._pending.set_exception(GreeConnectionError("MQTT connection lost"))
+
+    async def _discard_client(self) -> None:
+        """Close a client whose connection was lost."""
+        if self._client is None:
+            return
+
+        client, self._client = self._client, None
+        with contextlib.suppress(Exception):
+            await client.__aexit__(None, None, None)  # pylint: disable=unnecessary-dunder-call
 
     async def _receive_loop(self) -> None:
         """Receive MQTT messages."""
@@ -253,6 +300,11 @@ class GreeMqttTransport(GreeBaseTransport):
                         listener(topic, json.loads(payload))
                     except Exception:
                         _LOGGER.exception("MQTT listener raised")
+
+    @property
+    def connected(self) -> bool:
+        """True while the broker connection is up."""
+        return self._connected
 
     @property
     def cid(self) -> str:
