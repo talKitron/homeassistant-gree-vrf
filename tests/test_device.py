@@ -304,3 +304,24 @@ async def test_residential_unit_keeps_beeper_and_push_handling() -> None:
         _encrypted({"t": "dat", "cols": ["Pow"], "dat": [1]}),
     )
     assert device.power_mode is True
+
+
+async def test_half_degree_setpoint_is_shown(commercial_unit) -> None:
+    """GMV units report half degrees as SetDeciTem (245 = 24.5)."""
+    commercial_unit.values["SetDeciTem"] = 245
+    device, _ = await _bind(commercial_unit)
+
+    assert device.target_temperature == 24.5
+
+
+async def test_half_degree_ignored_when_it_disagrees(commercial_unit) -> None:
+    commercial_unit.values["SetDeciTem"] = 245
+    device, _ = await _bind(commercial_unit)
+
+    # A new setpoint waiting to be sent must not show the old half degree
+    device.set_target_temperature(26)
+    assert device.target_temperature == 26.0
+
+    # Only whole degrees are sent, SetDeciTem is read only
+    await device.push_device_status()
+    assert "SetDeciTem" not in commercial_unit.commands[-1]["opt"]
