@@ -21,7 +21,6 @@ This integration adds support for GREE GMV/VRF systems using the GREE cloud/MQTT
 - Vertical swing control
 - Horizontal swing control where supported by the indoor unit
 - GREE Cloud / MQTT communication
-- Tadiran / Gree commercial units behind a cloud gateway (see [docs/COMMERCIAL_UNIT_TESTING.md](docs/COMMERCIAL_UNIT_TESTING.md))
 - Home Assistant Config Flow setup
 - HACS installation
 
@@ -43,7 +42,7 @@ Open the menu in the upper-right corner and select:
 
 Enter the repository URL:
 
-`https://github.com/talKitron/homeassistant-gree-vrf`
+`https://github.com/Black01986/homeassistant-gree-vrf`
 
 For **Type**, select:
 
@@ -112,30 +111,24 @@ A single gateway may provide access to multiple individual indoor units. Each su
 
 ---
 
-## Current release - v0.1.9
+## Current release - v0.1.5
 
-### Commercial units (Tadiran SQ-240/1P and similar)
+### Fixes
 
-- Setup no longer fails with `Malformed response: cols=10 dat=9`. Ambiguous multi-property
-  answers are re-queried property by property instead of being guessed.
-- Missing device information (firmware/model) no longer blocks setup.
-- Status pushed by the unit (changes from the Gree app or the wall controller) is applied to
-  the entity state.
-- After a command, the state is read back and re-checked a few times. HA never shows a value
-  the unit did not report, and a failed command does not leave the requested value on screen.
-- The MQTT connection reconnects and resubscribes by itself. Entities are unavailable while
-  the state cannot be read.
-- "Restore Entities" defaults to off for new setups, so a restart does not resend old commands.
-- Credentials, tokens and device keys are redacted from debug logs and diagnostics.
+- Fixed the Config Flow import failure:
 
-Testing guide, diagnostics to collect and the acceptance checklist:
-[docs/COMMERCIAL_UNIT_TESTING.md](docs/COMMERCIAL_UNIT_TESTING.md)
+  `Config flow could not be loaded: {"message":"Invalid handler specified"}`
 
-### v0.1.5
+- Fixed the invalid indentation block in `cloud_api.py`.
+- Includes Python exception-handling compatibility fixes from previous test builds.
 
-- Fixed the Config Flow import failure
-  `Config flow could not be loaded: {"message":"Invalid handler specified"}`.
+### VRF support
+
 - Preserves the verified GREE GMV / VRF cloud and MQTT communication logic.
+- Supports routing commands to individual indoor units behind a common gateway.
+- Supports receiving status updates for individual VRF indoor units.
+- Includes VRF temperature/status handling.
+- Includes compatibility handling for VRF swing values.
 
 ---
 
@@ -148,19 +141,6 @@ The Home Assistant integration is located at:
 The Home Assistant integration domain remains:
 
 `gree_custom`
-
----
-
-## Development tests
-
-The tests use synthetic fixtures (no real credentials or devices) and need Python 3.14:
-
-```bash
-pip install -r requirements_test.txt
-pytest
-```
-
-Home Assistant's test plugin does not run on native Windows. Use Linux, macOS or WSL.
 
 ---
 
