@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import json
 
 import aiomqtt
 import pytest
 
 from custom_components.gree_custom.aiogree import transport_mqtt
+from custom_components.gree_custom.aiogree.api import gree_get_status, gree_set_status
+from custom_components.gree_custom.aiogree.cipher import EncryptionVersion, get_cipher
+from custom_components.gree_custom.aiogree.helpers import gree_decrypt_pack, gree_encrypt_pack
 from custom_components.gree_custom.aiogree.cloud_api import GreeRegion
 from custom_components.gree_custom.aiogree.errors import GreeConnectionError
 from custom_components.gree_custom.aiogree.transport_mqtt import GreeMqttTransport
 
-from .conftest import PARENT_MAC
+from .conftest import CHILD_MAC, DEVICE_KEY, PARENT_MAC
 
 
 @dataclass
@@ -148,3 +152,74 @@ async def test_unsubscribe_after_connection_loss(fake_client) -> None:
     await transport.unsubscribe(PARENT_MAC)
 
     assert not transport.connected_devices
+
+
+async def test_skips_responses_rejected_by_accept(fake_client) -> None:
+    transport = _transport()
+    await transport.subscribe(PARENT_MAC)
+    client = fake_client.instances[0]
+    client.auto_reply = False
+
+    task = asyncio.create_task(
+        transport.request(PARENT_MAC, "q", accept=lambda raw: raw == "good")
+    )
+    await asyncio.sleep(0.01)
+    client.queue.put_nowait(_Message(f"response/{PARENT_MAC}/x", b"stale"))
+    client.queue.put_nowait(_Message(f"response/{PARENT_MAC}/x", b"good"))
+
+    assert await asyncio.wait_for(task, 1) == "good"
+
+    await transport.disconnect()
+
+
+class DuplicatingGateway(FakeMqttClient):
+    """Gateway that answers every request twice, the copy arriving late.
+
+    The copy of an answer comes in after the next request was sent, ahead of
+    that request's own answer.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.cipher = get_cipher(EncryptionVersion.V1, DEVICE_KEY)
+        self.state = {"Pow": 0, "Mod": 1, "SetTem": 25}
+        self._late_copy: bytes | None = None
+
+    async def publish(self, topic: str, payload: str, qos: int = 0) -> None:
+        self.published.append((topic, payload))
+        request = gree_decrypt_pack(json.loads(payload), self.cipher)
+        pack = request["pack"]
+
+        if pack["t"] == "cmd":
+            self.state.update(dict(zip(pack["opt"], pack["p"], strict=True)))
+            answer = {"t": "res", "r": 200, "sub": pack["sub"], "opt": pack["opt"], "p": pack["p"]}
+        else:
+            cols = [c for c in pack["cols"] if c in self.state]
+            answer = {"t": "dat", "r": 200, "sub": pack["mac"], "cols": cols, "dat": [self.state[c] for c in cols]}
+
+        raw = json.dumps(gree_encrypt_pack({"t": "pack", "pack": answer}, self.cipher)).encode()
+        topic = f"response/{PARENT_MAC}/{CHILD_MAC}"
+        if self._late_copy is not None:
+            self.queue.put_nowait(_Message(topic, self._late_copy))
+        self.queue.put_nowait(_Message(topic, raw))
+        self._late_copy = raw
+
+
+async def test_duplicate_command_answer_is_not_taken_as_status(monkeypatch) -> None:
+    """Reproduces 'No data received while getting device status' after a command."""
+    monkeypatch.setattr(transport_mqtt.aiomqtt, "Client", DuplicatingGateway)
+    transport = _transport()
+    await transport.subscribe(PARENT_MAC)
+    cipher = get_cipher(EncryptionVersion.V1, DEVICE_KEY)
+
+    await gree_set_status(PARENT_MAC, CHILD_MAC, 0, {"Pow": 1}, cipher, transport)
+    res = await gree_get_status(PARENT_MAC, CHILD_MAC, 0, ["Pow", "Mod", "SetTem"], cipher, transport)
+
+    assert res.prop_values == {"Pow": 1, "Mod": 1, "SetTem": 25}
+
+    # And the duplicate of that status answer does not confuse the next command
+    await gree_set_status(PARENT_MAC, CHILD_MAC, 0, {"SetTem": 22}, cipher, transport)
+    res = await gree_get_status(PARENT_MAC, CHILD_MAC, 0, ["SetTem"], cipher, transport)
+    assert res.prop_values == {"SetTem": 22}
+
+    await transport.disconnect()

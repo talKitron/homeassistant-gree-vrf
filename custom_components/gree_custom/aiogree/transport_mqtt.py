@@ -1,6 +1,7 @@
 """Handles MQTT connections."""
 
 import asyncio
+from collections.abc import Callable
 import contextlib
 import json
 import logging
@@ -74,7 +75,9 @@ class GreeMqttTransport(GreeBaseTransport):
         self._receive_task: asyncio.Task | None = None
 
         self._request_lock = asyncio.Lock()
-        self._pending: asyncio.Future[str] | None = None
+        # Responses received while a request waits (str), or the error that
+        # ended the connection
+        self._pending: asyncio.Queue[str | Exception] | None = None
 
     @override
     def __str__(self) -> str:
@@ -198,7 +201,12 @@ class GreeMqttTransport(GreeBaseTransport):
         return None
 
     @override
-    async def request(self, mac_controller: str, json_str: str) -> str:
+    async def request(
+        self,
+        mac_controller: str,
+        json_str: str,
+        accept: Callable[[str], bool] | None = None,
+    ) -> str:
         """Publish one MQTT request and wait for its response."""
 
         try:
@@ -212,21 +220,32 @@ class GreeMqttTransport(GreeBaseTransport):
             raise GreeConnectionError("MQTT transport not connected")
 
         async with self._request_lock:
-            future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-            self._pending = future
+            queue: asyncio.Queue[str | Exception] = asyncio.Queue()
+            self._pending = queue
+            loop = asyncio.get_running_loop()
 
             try:
-                # Responses match 1:1 requests
                 await self._client.publish(
                     topic=f"request/{mac_controller}",
                     payload=json_str,
                     qos=1,
                 )
 
-                return await asyncio.wait_for(
-                    future,
-                    timeout=self._timeout,
-                )
+                deadline = loop.time() + self._timeout
+                while True:
+                    item = await asyncio.wait_for(
+                        queue.get(), timeout=max(0.0, deadline - loop.time())
+                    )
+                    if isinstance(item, Exception):
+                        raise item
+                    if accept is None or accept(item):
+                        return item
+
+                    # Duplicate or late answer to an earlier request
+                    _LOGGER.debug(
+                        "Ignoring MQTT response from %s that does not answer the request",
+                        mac_controller,
+                    )
 
             except TimeoutError as err:
                 raise GreeConnectionError(
@@ -261,8 +280,8 @@ class GreeMqttTransport(GreeBaseTransport):
 
         # The receive loop only ends when the connection is gone
         self._connected = False
-        if self._pending and not self._pending.done():
-            self._pending.set_exception(GreeConnectionError("MQTT connection lost"))
+        if self._pending is not None:
+            self._pending.put_nowait(GreeConnectionError("MQTT connection lost"))
 
     async def _discard_client(self) -> None:
         """Close a client whose connection was lost."""
@@ -288,12 +307,8 @@ class GreeMqttTransport(GreeBaseTransport):
             #
             # response/ completes pending request
             #
-            if (
-                topic.startswith("response/")
-                and self._pending
-                and not self._pending.done()
-            ):
-                self._pending.set_result(payload)
+            if topic.startswith("response/") and self._pending is not None:
+                self._pending.put_nowait(payload)
                 continue
 
             #
